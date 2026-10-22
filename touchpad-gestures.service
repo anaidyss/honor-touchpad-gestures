@@ -1,0 +1,10 @@
+[Unit]
+Description=Touchpad gestures (2-finger double click, edge volume/brightness)
+
+[Service]
+ExecStart=%h/.local/bin/touchpad-gestures
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

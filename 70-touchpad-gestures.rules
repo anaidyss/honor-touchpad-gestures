@@ -1,0 +1,2 @@
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="TOPS0102:00 35CC:0104 Touchpad", TAG+="uaccess"
+SUBSYSTEM=="hidraw", KERNELS=="0018:35CC:0104.*", TAG+="uaccess"

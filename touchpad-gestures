@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""Touchpad gestures for the Honor MagicBook Art 14 touchpad.
+
+- two-finger click or tap -> double click
+- edge slide (firmware report 14 on hidraw) -> left: brightness, right: volume
+- touches that start in the edge zones are hidden from the compositor so the cursor stays put
+
+The physical touchpad is grabbed and re-emitted through a uinput clone with the
+handled gestures filtered out.
+"""
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+
+import evdev
+from evdev import UInput, ecodes as e
+
+PAD_NAME = os.environ.get("TPG_PAD_NAME", "Touchpad")
+HID_ID = "HID_ID=0018:000035CC:00000104"
+CLONE_PREFIX = "tpg "
+EDGE_FRAC = 0.05        # width of the edge zones swallowed from the cursor, fraction of pad width
+TAP_MAX_S = 0.30        # two-finger tap: max duration
+TAP_MOVE_FRAC = 0.03    # two-finger tap: max finger drift, fraction of pad size
+STEP_PERCENT = 3        # percent per edge-slide report (about 20 reports per full pad height)
+EDGE_REPORT_ID = 14
+EDGE_ACTIONS = {4: "--output-volume", 3: "--brightness"}   # right edge, left edge
+EDGE_DIRS = {1: 1, 2: -1}                                  # up, down
+
+
+class Gestures:
+    def __init__(self, x_range, y_range, pad_write, mouse_click, mouse_button):
+        self.x_min, self.x_max = x_range
+        self.y_min, self.y_max = y_range
+        self.pad_write = pad_write
+        self.mouse_click = mouse_click
+        self.mouse_button = mouse_button
+        self.slot = 0
+        self.slots = {}
+        self.mode = None
+        self.btn_route = None
+        self.tap = None
+
+    def reset(self):
+        self.slots.clear()
+        self.mode = None
+        self.btn_route = None
+        self.tap = None
+
+    def _track(self, buf):
+        for t, c, v in buf:
+            if t == e.EV_ABS:
+                if c == e.ABS_MT_SLOT:
+                    self.slot = v
+                elif c == e.ABS_MT_TRACKING_ID:
+                    if v == -1:
+                        self.slots.pop(self.slot, None)
+                    else:
+                        self.slots[self.slot] = {"x": None, "y": None}
+                elif c == e.ABS_MT_POSITION_X:
+                    self.slots.setdefault(self.slot, {"x": None, "y": None})["x"] = v
+                elif c == e.ABS_MT_POSITION_Y:
+                    self.slots.setdefault(self.slot, {"x": None, "y": None})["y"] = v
+
+    def _in_edge(self, x):
+        width = self.x_max - self.x_min
+        if x is None or width <= 0:
+            return False
+        frac = (x - self.x_min) / width
+        return frac <= EDGE_FRAC or frac >= 1 - EDGE_FRAC
+
+    def _tap_update(self, count, now, pressed):
+        tap = self.tap
+        if tap is None or not tap["ok"]:
+            return
+        tap["max"] = max(tap["max"], count)
+        if pressed or count > 2 or now - tap["t0"] > TAP_MAX_S:
+            tap["ok"] = False
+            return
+        dx = (self.x_max - self.x_min) * TAP_MOVE_FRAC
+        dy = (self.y_max - self.y_min) * TAP_MOVE_FRAC
+        for slot, s in self.slots.items():
+            if s["x"] is None or s["y"] is None:
+                continue
+            x0, y0 = tap["start"].setdefault(slot, (s["x"], s["y"]))
+            if abs(s["x"] - x0) > dx or abs(s["y"] - y0) > dy:
+                tap["ok"] = False
+
+    def frame(self, buf, now=None):
+        now = time.monotonic() if now is None else now
+        prev = len(self.slots)
+        self._track(buf)
+        count = len(self.slots)
+
+        if self.mode is None and prev == 0 and count > 0:
+            self.mode = "normal"
+            if count == 1:
+                (s,) = self.slots.values()
+                if self._in_edge(s["x"]):
+                    self.mode = "edge"
+            if self.mode == "normal":
+                self.tap = {"t0": now, "ok": True, "max": 0, "start": {}}
+
+        pressed = any(t == e.EV_KEY and c == e.BTN_LEFT and v == 1 for t, c, v in buf)
+        if self.mode == "normal":
+            self._tap_update(count, now, pressed)
+
+        out = []
+        for ev in buf:
+            t, c, v = ev
+            if t == e.EV_KEY and c == e.BTN_LEFT:
+                if v == 1:
+                    if self.mode == "edge":
+                        self.btn_route = "mouse"
+                    elif self.mode == "normal" and count == 2:
+                        self.btn_route = "swallow"
+                        self.mouse_click(2)
+                        continue
+                    else:
+                        self.btn_route = "pad"
+                route = self.btn_route
+                if v == 0:
+                    self.btn_route = None
+                if route == "mouse":
+                    self.mouse_button(v)
+                    continue
+                if route == "swallow":
+                    continue
+            elif self.mode == "edge":
+                continue
+            out.append(ev)
+
+        if any(t != e.EV_MSC for t, _, _ in out):
+            self.pad_write(out)
+
+        if count == 0:
+            tap, self.tap = self.tap, None
+            if self.mode == "normal" and tap and tap["ok"] and tap["max"] == 2:
+                self.mouse_click(2)
+            self.mode = None
+
+
+def edge_report(data):
+    """Map a raw hidraw report to (swayosd action, signed percent) or None."""
+    if len(data) < 3 or data[0] != EDGE_REPORT_ID:
+        return None
+    action, sign = EDGE_ACTIONS.get(data[1]), EDGE_DIRS.get(data[2])
+    if action is None or sign is None:
+        return None
+    return action, sign * STEP_PERCENT
+
+
+def find_pad():
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except OSError:
+            continue
+        caps = dev.capabilities()
+        if (PAD_NAME in dev.name and not dev.name.startswith(CLONE_PREFIX)
+                and e.ABS_MT_POSITION_X in [c for c, _ in caps.get(e.EV_ABS, [])]):
+            return dev
+        dev.close()
+    return None
+
+
+def open_hidraw():
+    try:
+        names = os.listdir("/sys/class/hidraw")
+    except OSError:
+        return None
+    for name in names:
+        try:
+            with open("/sys/class/hidraw/%s/device/uevent" % name) as f:
+                if HID_ID not in f.read():
+                    continue
+            return os.open("/dev/" + name, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as err:
+            print("hidraw %s unavailable (%s): edge volume/brightness disabled" % (name, err),
+                  flush=True)
+    return None
+
+
+def main():
+    dev = None
+    while dev is None:
+        dev = find_pad()
+        if dev is None:
+            time.sleep(3)
+
+    absinfo = {c: i for c, i in dev.capabilities().get(e.EV_ABS, [])}
+    xi, yi = absinfo[e.ABS_MT_POSITION_X], absinfo[e.ABS_MT_POSITION_Y]
+
+    info = dev.info
+    pad = UInput.from_device(
+        dev, name=CLONE_PREFIX + dev.name, vendor=info.vendor, product=info.product,
+        version=info.version, bustype=info.bustype, input_props=dev.input_props())
+    mouse = UInput(
+        {e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE], e.EV_REL: [e.REL_X, e.REL_Y]},
+        name=CLONE_PREFIX + "mouse")
+
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+
+    def pad_write(events):
+        for t, c, v in events:
+            if t == e.EV_SYN:
+                continue
+            pad.write(t, c, v)
+        pad.syn()
+
+    def mouse_button(v):
+        mouse.write(e.EV_KEY, e.BTN_LEFT, v)
+        mouse.syn()
+
+    def mouse_click(n):
+        for _ in range(n):
+            mouse_button(1)
+            time.sleep(0.012)
+            mouse_button(0)
+            time.sleep(0.012)
+
+    def adjust(action, steps):
+        subprocess.Popen(["swayosd-client", action, "%+d" % steps], stdout=subprocess.DEVNULL)
+
+    g = Gestures((xi.min, xi.max), (yi.min, yi.max), pad_write, mouse_click, mouse_button)
+
+    def shutdown(*_):
+        pad.close()
+        mouse.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    hid = open_hidraw()
+    dev.grab()
+    buf = []
+    fds = [dev.fd] + ([hid] if hid is not None else [])
+    try:
+        while True:
+            ready, _, _ = select.select(fds, [], [])
+            if hid in ready:
+                while True:
+                    try:
+                        data = os.read(hid, 64)
+                    except BlockingIOError:
+                        break
+                    step = edge_report(data)
+                    if step:
+                        adjust(*step)
+            if dev.fd in ready:
+                for ev in dev.read():
+                    if ev.type == e.EV_SYN:
+                        if ev.code == e.SYN_REPORT:
+                            g.frame(buf)
+                        elif ev.code == e.SYN_DROPPED:
+                            g.reset()
+                        buf = []
+                        continue
+                    buf.append((ev.type, ev.code, ev.value))
+    finally:
+        pad.close()
+        mouse.close()
+
+
+if __name__ == "__main__":
+    main()
